@@ -31,7 +31,7 @@ from ..context import ContextCompiler
 from ..contracts import (
     ApprovalRequired, Autonomy, BudgetExhausted, CapabilityUnavailable, ContextItem,
     ContextProjection, DelegationContract, EgressDenied, ModelProfile, PolicyDenied,
-    Principal, RiskTier, RunEnvelope, VerificationFailed, new_id,
+    Principal, RiskTier, RunEnvelope, VerificationFailed, content_hash, new_id,
 )
 from ..evidence.support import Claim, ClaimSupport, Evidence
 from ..kernel import TrustedKernel
@@ -126,29 +126,60 @@ class RunResult:
 class Runner:
     """Drives the trusted path. The only supported way to execute work."""
 
-    #: The canonical stage order. Recorded on every run so a skipped stage is visible.
-    STAGES = ("bind", "classify", "envelope", "plan", "resolve", "compile", "preflight",
-              "execute", "capture", "evidence", "verify", "output_gate", "commit")
+    #: The canonical stage order, recorded on every run so a skipped stage is visible.
+    #: Bound to the module-level ``STAGES`` rather than restated: the class copy had drifted
+    #: to thirteen old names while ``run()`` emitted the sixteen above, so anything reading
+    #: ``Runner.STAGES`` as the state machine got a definition no run has produced since
+    #: v0.1.
+    STAGES: tuple[str, ...] = STAGES
 
     def __init__(self, kernel: TrustedKernel, *, registry: CapabilityRegistry | None = None,
                  graph: WorkGraph | None = None, compiler: ContextCompiler | None = None,
                  model: ModelProfile | None = None,
                  model_invoke: Callable[[str], str] | None = None,
-                 policy: Any = None, system_prompt: str = "") -> None:
+                 policy: Any = None, system_prompt: str = "",
+                 clamp_policy: bool = False) -> None:
         self.kernel = kernel
-        self.policy = policy or kernel.policy
+        #: Clamp a wider run policy to the kernel's instead of refusing it. Off by default:
+        #: a caller who states an authority they must not have should hear so.
+        self.clamp_policy = clamp_policy
+        self.policy = self._contain(policy) if policy is not None else kernel.policy
         self.config = kernel.config
         self.registry = registry or CapabilityRegistry()
-        self.graph = graph or WorkGraph(self.config.index_store)
+        #: The kernel's WorkGraph by default. v0.4 opened a *second* SQLite connection to
+        #: the same index file, which nothing ever closed — ``kernel.close()`` closes the
+        #: kernel's — and which made the Runner's writes and the kernel's two views of one
+        #: database.
+        self.graph = graph if graph is not None else kernel.graph
         self.compiler = compiler or ContextCompiler()
         self.model = model
         self.model_invoke = model_invoke
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         self._signatures: dict[str, int] = {}
 
+    def _contain(self, policy: Any) -> Any:
+        """Refuse (or clamp) a run policy that grants more than the kernel's.
+
+        This is the hole a reviewer drove a public model call through: the kernel was built
+        under ``peer_review`` ("no network egress of any kind"), ``Runner.run(policy=...)``
+        was handed a ``literature``-shaped policy, and the run reached a public provider
+        with ``model_calls=1, refusals=0``. Nothing was broken in the gates — they faithfully
+        enforced the envelope they were given, and the envelope had been minted under a
+        policy the kernel never agreed to.
+
+        The kernel is the policy root. A per-run policy may narrow it and may not widen it,
+        on any dimension ``PolicySnapshot.violations_against`` knows about.
+        """
+        kernel_policy = self.kernel.policy
+        if self.clamp_policy:
+            return policy.meet(kernel_policy)
+        return policy.enforce_within(
+            kernel_policy,
+            operation=f"a run policy under kernel policy {kernel_policy.profile_id!r}")
+
     # --------------------------------------------------------------------- run
     def run(self, request: str, *, policy: Any = None, project_id: str = "",
-            task_title: str = "", risk: RiskTier | None = None,
+            task_id: str = "", task_title: str = "", risk: RiskTier | None = None,
             autonomy: Autonomy | None = None,
             allowed_destinations: Sequence[Destination] | None = None,
             memory: Iterable[ContextItem] = (), sources: Mapping[str, Any] | None = None,
@@ -186,7 +217,7 @@ class Runner:
         try:
             # 0. INGEST — the raw request enters the system and is wrapped, nothing more.
             with stage("ingest") as ctx:
-                policy = policy or self.policy
+                policy = self._contain(policy) if policy is not None else self.policy
                 ctx.detail = f"{len(request)} chars, profile={policy.profile_id}"
 
             # 1. CLASSIFY — before anything is stored, anywhere.
@@ -197,34 +228,52 @@ class Runner:
             # 2. POLICY_SNAPSHOT — frozen for the whole run.
             with stage("policy_snapshot") as ctx:
                 envelope = policy.envelope(
-                    task_id="", project_id=project_id,
+                    task_id=task_id, project_id=project_id,
                     **({"risk": risk} if risk is not None else {}),
                     **({"autonomy": autonomy} if autonomy is not None else {}))
                 if allowed_destinations is not None:
-                    envelope = envelope.restrict(allowed_destinations=allowed_destinations)
+                    # Carry the budget across explicitly: ``restrict`` defaults to
+                    # ``budget.child()``, so narrowing destinations alone silently cut the
+                    # run's token and call ceilings to a quarter.
+                    envelope = envelope.restrict(
+                        allowed_destinations=allowed_destinations, budget=envelope.budget)
                 result.run_id = envelope.run_id
                 result.policy_snapshot = policy
+                persistent = envelope.permits_destination(Destination.PERSISTENT)
                 self.kernel.audit("run_created", run_id=envelope.run_id,
                                   detail=policy.as_dict())
                 ctx.detail = policy.summary()
 
             # 3. BIND — now safe: the label is known, so the write is classified.
+            #
+            # Unless the run may not persist at all. A profile that excludes PERSISTENT
+            # (peer_review: "review material should not be retained") gets an EPHEMERAL run:
+            # the trusted path still classifies, gates, verifies and releases, and the event
+            # chain still records what happened — events carry references and hashes, never
+            # content — but nothing durable is written. v0.5 wrote the task node regardless,
+            # with the request text as its title.
+            run_node = None
             with stage("bind") as ctx:
-                project_id = project_id or self._default_project()
-                task = self.kernel.persistence.commit_node(
-                    kind=NodeKind.TASK, title=task_title or request[:110],
-                    body="", principal=envelope.principal.id, source_run=envelope.run_id,
-                    project_id=project_id, status="in_progress",
-                    validation_status="system")
-                run_node = self.kernel.persistence.commit_node(
-                    kind=NodeKind.RUN, title=f"run {envelope.run_id[:12]}",
-                    principal=envelope.principal.id, source_run=envelope.run_id,
-                    project_id=project_id, status="running", ref=envelope.run_id,
-                    validation_status="system")
-                self.graph.link(project_id, task, EdgeKind.HAS)
-                self.graph.link(task, run_node, EdgeKind.HAS)
-                result.node_ids = {"task": task.id, "run": run_node.id}
-                ctx.detail = f"task={task.id[:12]} label={task.label.sensitivity.name}"
+                if not persistent:
+                    ctx.detail = (f"ephemeral: profile {policy.profile_id!r} does not "
+                                  "permit PERSISTENT, so nothing is written to the WorkGraph")
+                else:
+                    project_id = project_id or self._default_project()
+                    task = self.kernel.persistence.commit_node(
+                        kind=NodeKind.TASK, title=task_title or request[:110],
+                        body="", principal=envelope.principal.id,
+                        source_run=envelope.run_id, envelope=envelope,
+                        project_id=project_id, status="in_progress",
+                        validation_status="system")
+                    run_node = self.kernel.persistence.commit_node(
+                        kind=NodeKind.RUN, title=f"run {envelope.run_id[:12]}",
+                        principal=envelope.principal.id, source_run=envelope.run_id,
+                        envelope=envelope, project_id=project_id, status="running",
+                        ref=envelope.run_id, validation_status="system")
+                    self.graph.link(project_id, task, EdgeKind.HAS)
+                    self.graph.link(task, run_node, EdgeKind.HAS)
+                    result.node_ids = {"task": task.id, "run": run_node.id}
+                    ctx.detail = f"task={task.id[:12]} label={task.label.sensitivity.name}"
 
             # 4-5. PLAN and VALIDATE_PLAN
             with stage("plan") as ctx:
@@ -251,7 +300,11 @@ class Runner:
                                          label=labeled_request.label))
                 projection = self.compiler.compile(
                     items=items, envelope=envelope, destination=destination,
-                    token_budget=envelope.budget.tokens_soft, query=request)
+                    # The smaller of the run's own soft budget and the deployment-wide
+                    # context ceiling. ``context_token_budget`` was a setting nothing read.
+                    token_budget=min(envelope.budget.tokens_soft,
+                                     self.config.context_token_budget),
+                    query=request)
                 result.projection = projection
                 ctx.detail = projection.summary()
 
@@ -288,29 +341,39 @@ class Runner:
                 supports = self._verify_claims(candidate_output, records)
                 result.supports = supports
                 unsupported = [s for s in supports if not s.supports]
-                for support in unsupported:
-                    self.kernel.persistence.commit_rejected(
-                        statement=support.claim, reason=support.rationale,
-                        principal=envelope.principal.id, source_run=envelope.run_id,
-                        project_id=project_id)
+                if persistent:
+                    for support in unsupported:
+                        self.kernel.persistence.commit_rejected(
+                            statement=support.claim, reason=support.rationale,
+                            principal=envelope.principal.id, source_run=envelope.run_id,
+                            envelope=envelope, project_id=project_id)
                 ctx.detail = f"{len(supports)} checked, {len(unsupported)} unsupported"
 
             # 13. RELEASE_GATE — the only path by which output becomes readable.
             with stage("release_gate") as ctx:
+                # BOTH requirements, from the RUN's policy. v0.5 forwarded only
+                # require_citation, so the gate judged claim support using whatever the
+                # kernel had been configured with — the exact split the policy module's
+                # docstring says it exists to prevent, reintroduced one field over.
                 verdict = self.kernel.output_gate.check(
                     labeled_output, envelope, sources=records,
-                    require_citation=policy.require_citation)
+                    require_citation=policy.require_citation,
+                    require_support=policy.require_claim_support)
                 result.released_output = self.kernel.quarantine.release(
                     quarantine_ref, run_id=envelope.run_id)
                 ctx.detail = verdict.reason[:110]
 
             # 14. COMMIT_VALIDATED_STATE — only verified knowledge enters project memory.
             with stage("commit_validated_state") as ctx:
-                committed = self._commit_claims(supports, project_id, run_node.id, envelope)
-                self.kernel.persistence.update_node(
-                    run_node.id, principal=envelope.principal.id,
-                    source_run=envelope.run_id, status="complete")
-                ctx.detail = f"{committed} verified claim(s) committed"
+                if not persistent or run_node is None:
+                    ctx.detail = "ephemeral run: no claim entered project memory"
+                else:
+                    committed = self._commit_claims(supports, project_id, run_node.id,
+                                                    envelope)
+                    self.kernel.persistence.update_node(
+                        run_node.id, principal=envelope.principal.id,
+                        source_run=envelope.run_id, envelope=envelope, status="complete")
+                    ctx.detail = f"{committed} verified claim(s) committed"
 
             # 15. CHECKPOINT
             with stage("checkpoint") as ctx:
@@ -373,19 +436,39 @@ class Runner:
     def _preflight(self, request: str, projection: ContextProjection,
                    envelope: RunEnvelope) -> None:
         """Check the run is permissible before anything executes."""
-        signature = f"{envelope.task_id}:{hash(request) & 0xffffffff}"
-        count = self._signatures.get(signature, 0) + 1
-        self._signatures[signature] = count
-        if count >= self.config.stuck_loop_threshold:
-            raise StuckLoop(
-                f"the same request has been issued {count} times with identical arguments; "
-                "stopping rather than looping")
+        self._check_stuck_loop(request, envelope)
         if envelope.expired:
             raise BudgetExhausted("run deadline passed before execution")
         if projection.label.sensitivity > envelope.max_label.sensitivity:
             raise PolicyDenied(
                 f"compiled context is {projection.label.sensitivity.name} but this run's "
                 f"ceiling is {envelope.max_label.sensitivity.name}")
+
+    def _check_stuck_loop(self, request: str, envelope: RunEnvelope) -> None:
+        """Refuse a repeating loop — and only a loop.
+
+        The counter was keyed on ``f"{envelope.task_id}:{hash(request)}"`` while ``run()``
+        always minted ``task_id=""``, so the key was the request alone and the count was
+        global to the Runner and never cleared. Three independent users asking the same
+        question through one long-lived Runner got: ok, ok, ``StuckLoop``. A loop detector
+        that fires on non-loops is a availability bug wearing a safety label.
+
+        A loop happens *within* a unit of work, so detection is scoped to one: a task id, or
+        a parent run for a delegated child. A one-shot top-level run belongs to no such unit
+        and is not counted — pass ``task_id=`` to ``run()`` to group runs that should be.
+        """
+        scope = envelope.task_id or envelope.parent_run_id or ""
+        if not scope:
+            return
+        signature = f"{scope}:{content_hash(request)[:32]}"
+        count = self._signatures.get(signature, 0) + 1
+        self._signatures[signature] = count
+        if len(self._signatures) > 4096:           # bounded: this is a detector, not a log
+            self._signatures.pop(next(iter(self._signatures)))
+        if count >= self.config.stuck_loop_threshold:
+            raise StuckLoop(
+                f"the same request has been issued {count} times within {scope!r} with "
+                "identical arguments; stopping rather than looping")
 
     def _execute(self, projection: ContextProjection, envelope: RunEnvelope) -> Any:
         """Run the model call through the broker. Never calls a provider directly."""
@@ -457,11 +540,12 @@ class Runner:
                 claim_node = self.kernel.persistence.commit_node(
                     kind=NodeKind.CLAIM, title=support.claim[:140],
                     principal=envelope.principal.id, source_run=envelope.run_id,
-                    project_id=project_id, validation_status="verified")
+                    envelope=envelope, project_id=project_id,
+                    validation_status="verified")
                 evidence_node = self.kernel.persistence.commit_node(
                     kind=NodeKind.EVIDENCE, title=support.identifier,
                     body=support.evidence_span[:200], principal=envelope.principal.id,
-                    source_run=envelope.run_id, project_id=project_id,
+                    source_run=envelope.run_id, envelope=envelope, project_id=project_id,
                     ref=support.identifier, validation_status="verified",
                     relationship=support.relationship.value,
                     confidence=support.confidence,

@@ -7,7 +7,7 @@
   "accuracy": 1.0,
   "false_accepts": 0,
   "false_refuses": 0,
-  "median_latency_ms": 0.2553,
+  "median_latency_ms": 0.367,
   "by_category": {
     "faithful": {
       "n": 7,
@@ -119,11 +119,11 @@
     ]
   },
   "cost": {
-    "lexical_only_ms": 0.1143,
-    "claim_parse_ms": 0.0582,
-    "scope_extract_ms": 0.7639,
-    "scope_check_ms": 0.009,
-    "full_structured_ms": 0.242,
-    "overhead_x": 2.12
+    "lexical_only_ms": 0.1856,
+    "claim_parse_ms": 0.0754,
+    "scope_extract_ms": 0.9939,
+    "scope_check_ms": 0.0103,
+    "full_structured_ms": 0.3671,
+    "overhead_x": 1.98
   }
 }

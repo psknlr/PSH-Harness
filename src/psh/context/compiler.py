@@ -23,6 +23,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .. import text as psh_text
 from ..contracts import ContextItem, ContextProjection, RunEnvelope
 from ..labels import DataLabel, Destination, Sensitivity, combine
 
@@ -166,14 +167,8 @@ class ContextCompiler:
             dropped=trace.dropped_policy + trace.dropped_budget, run_id=envelope.run_id)
 
 
-_WORD = re.compile(r"[a-z][a-z0-9-]{2,}")
-
-
 def _terms(text: str) -> set[str]:
-    return set(_WORD.findall(text.lower()))
-
-
-_TOKEN = re.compile(r"[a-z0-9][a-z0-9.-]*")
+    return psh_text.terms(text)
 
 
 def _fingerprint(text: str) -> str:
@@ -185,8 +180,12 @@ def _fingerprint(text: str) -> str:
     silently dropped. The benchmark caught it: 592 distinct candidates deduplicated to 4.
     Silently discarding a distinct memory or evidence item is a correctness failure, not a
     thrift measure.
+
+    The same failure, in a form no English benchmark could show: the pattern was ASCII-only,
+    so every Chinese-only item fingerprinted to ``""`` and three distinct Chinese memories
+    deduplicated to one. Segmentation now lives in ``psh.text``, which handles both.
     """
-    return " ".join(sorted(_TOKEN.findall(text.lower())))[:400]
+    return psh_text.fingerprint(text)
 
 
 def _truncate_compressor(text: str, max_chars: int) -> str:

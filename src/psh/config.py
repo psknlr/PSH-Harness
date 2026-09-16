@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
+from typing import ClassVar
 from pathlib import Path
 
 from .contracts import Budget, RiskTier
@@ -34,10 +35,18 @@ class PSHConfig:
     state_dir: Path = field(default_factory=default_state_dir)
     profile: str = "default"
     policy_version: str = "1"
+    #: Ceiling on compiled context, applied by ``Runner`` alongside the envelope's own
+    #: ``budget.tokens_soft`` — the smaller of the two wins.
     context_token_budget: int = 120_000
+    #: Loop detection, consumed by ``Runner._check_stuck_loop``.
+    stuck_loop_threshold: int = 3
+    #: DECLARED BUT NOT YET CONSUMED. Kept because the mechanisms they configure are
+    #: planned, and listed here rather than left to look load-bearing: a settings object
+    #: whose fields silently do nothing is how a deployment comes to believe it has tuned
+    #: something. ``test_config_fields_are_either_consumed_or_listed_as_pending`` pins this
+    #: list, so wiring one of them up means deleting it from here.
     compaction_threshold: float = 0.75
     offload_threshold_bytes: int = 8_000
-    stuck_loop_threshold: int = 3
     max_retries: int = 2
     budget: Budget = field(default_factory=Budget)
     default_risk: RiskTier = RiskTier.R1_ROUTINE
@@ -92,6 +101,10 @@ class PSHConfig:
         except OSError:  # pragma: no cover - platform dependent
             pass
         return self
+
+    #: Fields this version does not read anywhere. See the comment above.
+    PENDING_FIELDS: ClassVar[tuple[str, ...]] = (
+        "compaction_threshold", "offload_threshold_bytes", "max_retries")
 
     def with_(self, **kw) -> "PSHConfig":
         return replace(self, **kw)

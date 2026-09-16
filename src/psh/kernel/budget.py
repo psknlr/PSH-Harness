@@ -174,27 +174,39 @@ class BudgetGovernor:
         state.delegations += 1
 
     def _enforce(self, envelope: RunEnvelope) -> None:
+        """Raise when a hard ceiling has been EXCEEDED, warn when a soft one has.
+
+        ``>=`` was wrong at zero, and zero is a value profiles deliberately use. The
+        ``peer_review`` profile sets ``usd_hard=0.0`` to say "this mode runs on local models
+        and must not spend anything"; ``state.usd >= budget.usd_hard`` is true before the
+        run does anything at all, so the profile refused every run it was given with
+        "hard cost ceiling reached ($0.00 >= $0.00)" and was, in practice, unusable. A
+        ceiling of zero permits spending nothing, which is exactly what it should mean.
+
+        Soft warnings are likewise only interesting once something has been spent: a
+        soft-budget warning at zero usage trains its reader to ignore the next one.
+        """
         budget = self._budget_for(envelope)
         state = self._state(envelope)
-        if state.tokens >= budget.tokens_hard:
+        if state.tokens > budget.tokens_hard:
             raise BudgetExhausted(
-                f"hard token ceiling reached ({state.tokens} >= {budget.tokens_hard}); "
+                f"hard token ceiling exceeded ({state.tokens} > {budget.tokens_hard}); "
                 "run stopped")
-        if state.usd >= budget.usd_hard:
+        if state.usd > budget.usd_hard:
             raise BudgetExhausted(
-                f"hard cost ceiling reached (${state.usd:.2f} >= ${budget.usd_hard:.2f})")
-        if state.elapsed >= budget.seconds_hard:
+                f"hard cost ceiling exceeded (${state.usd:.2f} > ${budget.usd_hard:.2f})")
+        if state.elapsed > budget.seconds_hard:
             raise BudgetExhausted(
-                f"hard time ceiling reached ({state.elapsed/60:.1f} min)")
+                f"hard time ceiling exceeded ({state.elapsed/60:.1f} min)")
         if envelope.expired:
             raise BudgetExhausted("run deadline passed")
-        if state.tokens >= budget.tokens_soft:
+        if state.tokens > 0 and state.tokens >= budget.tokens_soft:
             self._warn(envelope, "tokens",
                        f"soft token budget passed ({state.tokens}/{budget.tokens_soft})")
-        if state.usd >= budget.usd_soft:
+        if state.usd > 0 and state.usd >= budget.usd_soft:
             self._warn(envelope, "usd",
                        f"soft cost budget passed (${state.usd:.2f}/${budget.usd_soft:.2f})")
-        if state.elapsed >= budget.seconds_soft:
+        if state.elapsed > 0 and state.elapsed >= budget.seconds_soft:
             self._warn(envelope, "time",
                        f"soft time budget passed ({state.elapsed/60:.0f} min)")
 

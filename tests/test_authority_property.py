@@ -13,14 +13,34 @@ someone remembering to write its test.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
-hypothesis = pytest.importorskip("hypothesis")
+# ``importorskip`` turned a missing declared dependency into a green run: hypothesis is in
+# the project's ``[test]`` extra, and the checks that cover the lattice exhaustively were the
+# ones a clean environment quietly dropped — 223 passed, 1 skipped, and the skip was the only
+# test that examines every authority dimension. A declared dependency that is absent is a
+# broken environment, and CI should say so. Set PSH_ALLOW_MISSING_HYPOTHESIS=1 to opt out
+# deliberately (an air-gapped machine with no wheel, say), which is a decision someone makes
+# rather than one that happens to them.
+try:
+    import hypothesis
+except ImportError:  # pragma: no cover - environment dependent
+    if os.environ.get("PSH_ALLOW_MISSING_HYPOTHESIS") == "1":
+        pytest.skip("hypothesis absent and PSH_ALLOW_MISSING_HYPOTHESIS=1",
+                    allow_module_level=True)
+    pytest.fail("hypothesis is a declared test dependency (pip install -e '.[test]') and "
+                "the authority-monotonicity property tests are the only exhaustive check "
+                "of the lattice; refusing to report a pass without them. Set "
+                "PSH_ALLOW_MISSING_HYPOTHESIS=1 to skip deliberately.", pytrace=False)
 from hypothesis import HealthCheck, assume, given, settings  # noqa: E402
 from hypothesis import strategies as st  # noqa: E402
 
+from dataclasses import replace  # noqa: E402
+
 from psh.contracts import Autonomy, Budget, PolicyDenied, RiskTier, RunEnvelope  # noqa: E402
-from psh.kernel.authority import AuthorityLattice  # noqa: E402
+from psh.kernel.authority import UNRESTRICTED, AuthorityLattice  # noqa: E402
 from psh.labels import DataLabel, Destination, Sensitivity  # noqa: E402
 
 SETTINGS = settings(max_examples=250, deadline=None,
@@ -162,28 +182,86 @@ def test_meet_is_a_lower_bound_of_both(requested, parent):
         AuthorityLattice.violations(clamped, parent)
 
 
+#: One widening per dimension, applied to a parent envelope. Each returns a child that
+#: exceeds its parent on exactly that dimension and on no other.
+_WIDENINGS = {
+    "risk": lambda e: replace(e, risk=RiskTier(min(4, e.risk + 1))),
+    "autonomy": lambda e: replace(e, autonomy=Autonomy.ACT),
+    "max_label": lambda e: replace(e, max_label=DataLabel(Sensitivity.SECRET)),
+    "destinations": lambda e: replace(
+        e, allowed_destinations=frozenset(_DESTINATIONS)),
+    "capabilities": lambda e: replace(e, allowed_capabilities=UNRESTRICTED),
+    "denied_capabilities": lambda e: replace(e, denied_capabilities=()),
+    "deadline": lambda e: replace(e, deadline=None),
+    "require_isolated_tools": lambda e: replace(e, require_isolated_tools=False),
+    **{f"budget.{dimension}": (lambda d: lambda e: replace(
+        e, budget=replace(e.budget, **{d: getattr(e.budget, d) * 10 + 1})))(dimension)
+       for dimension in AuthorityLattice.BUDGET_DIMENSIONS},
+}
+
+
+@pytest.mark.parametrize("dimension", sorted(_WIDENINGS))
 @given(envelopes())
 @SETTINGS
-def test_delegation_contract_cannot_exceed_its_parent_run(parent):
-    """Delegation uses the same predicate, so it inherits the same guarantee."""
+def test_one_widened_dimension_at_a_time_is_caught(dimension, parent):
+    """Widen exactly one dimension and require the lattice to name that dimension.
+
+    The previous version of this test built a child that was maximal on *every* dimension at
+    once, with ``tokens_hard = 10**9`` against a parent whose strategy tops out at 100_000.
+    Every generated case therefore failed on ``budget.tokens_hard`` before any other
+    dimension was consulted — so the test passed while ``DelegationGateway`` checked four
+    dimensions out of sixteen, and a reviewer found that by hand. A property test whose
+    first condition always dominates is a test of that one condition.
+
+    Mutating one dimension at a time is what makes each dimension load-bearing: remove a
+    check from the lattice and exactly one parameterisation goes red.
+    """
+    parent = replace(parent, require_isolated_tools=True, deadline=parent.deadline or 1000.0)
+    child = _WIDENINGS[dimension](parent)
+    assume(child != parent)
+    violations = AuthorityLattice.violations(child, parent)
+    assume(violations or _is_noop_widening(dimension, parent, child))
+    if not violations:
+        return          # the mutation happened to be a no-op on this parent
+    names = {v.dimension for v in violations}
+    assert dimension in names or dimension.replace("budget.", "budget.") in names, \
+        f"widening {dimension} was not reported; lattice said {sorted(names)}"
+
+
+def _is_noop_widening(dimension: str, parent, child) -> bool:
+    """True when the mutation could not widen this particular parent (already at the top)."""
+    return child == parent
+
+
+@pytest.mark.parametrize("dimension", sorted(_WIDENINGS))
+@given(envelopes())
+@SETTINGS
+def test_delegation_refuses_each_widened_dimension(dimension, parent):
+    """The delegation gateway inherits the guarantee, dimension by dimension.
+
+    This is the test that would have caught v0.5's hand-written delegation check: it allowed
+    a child with R4/ACT/unrestricted capabilities and 999x the budget because it compared
+    four fields of its own choosing.
+    """
     from psh.contracts import DelegationContract
-
-    # A contract asking for the widest possible authority on every dimension.
-    widest = RunEnvelope(
-        risk=RiskTier.R4_KERNEL, autonomy=Autonomy.ACT,
-        max_label=DataLabel(Sensitivity.SECRET),
-        allowed_destinations=frozenset(_DESTINATIONS),
-        budget=Budget(tokens_soft=10 ** 9, tokens_hard=10 ** 9, usd_soft=1e6, usd_hard=1e6,
-                      seconds_soft=1e9, seconds_hard=1e9, max_model_calls=10 ** 6,
-                      max_tool_calls=10 ** 6, max_delegations=10 ** 6))
-    contract = DelegationContract(
-        task_id="t1", objective="anything", envelope=widest)
-
     from psh.kernel.egress import DelegationGateway
 
+    parent = replace(parent, require_isolated_tools=True, deadline=parent.deadline or 1000.0)
+    child = _WIDENINGS[dimension](parent)
+    assume(AuthorityLattice.violations(child, parent))
+    contract = DelegationContract(task_id="t1", objective="anything", envelope=child)
     decision = DelegationGateway().check(contract, parent)
-    if decision.allowed:
-        assert AuthorityLattice.is_subset(contract.envelope, parent), \
-            "a delegation the gateway allowed granted authority the parent lacks"
-    else:
-        assert not AuthorityLattice.is_subset(contract.envelope, parent)
+    assert not decision.allowed, (
+        f"delegation widening {dimension} was allowed; "
+        f"lattice sees {[str(v) for v in AuthorityLattice.violations(child, parent)]}")
+
+
+@given(envelopes())
+@SETTINGS
+def test_a_contained_delegation_is_still_allowed(parent):
+    """The gateway must not refuse everything: a child equal to its parent passes."""
+    from psh.contracts import DelegationContract
+    from psh.kernel.egress import DelegationGateway
+
+    contract = DelegationContract(task_id="t1", objective="anything", envelope=parent)
+    assert DelegationGateway().check(contract, parent).allowed

@@ -85,13 +85,14 @@ class PersistenceGateway:
                     body: str = "", status: str = "open",
                     validation_status: str = ValidationStatus.CANDIDATE,
                     project_id: str = "", ref: str = "",
+                    envelope: RunEnvelope | None = None,
                     provenance: Mapping[str, Any] | None = None, **meta: Any) -> Any:
         """Classify, authorise and write one WorkGraph node."""
         request = CommitRequest(
             content={"title": title, "body": body, "meta": meta},
             principal=principal, source_run=source_run,
             validation_status=validation_status, provenance=dict(provenance or {}))
-        label = self._authorise(request)
+        label = self._authorise(request, envelope)
 
         self.commits += 1
         node = self.graph.add(kind, title, project_id=project_id, body=body, status=status,
@@ -117,7 +118,7 @@ class PersistenceGateway:
             "and source_run so the write is classified and attributable")
 
     def update_node(self, node_id: str, *, principal: str, source_run: str,
-                    **fields: Any) -> bool:
+                    envelope: RunEnvelope | None = None, **fields: Any) -> bool:
         """Update a node, re-classifying any content that changed.
 
         v0.1's ``update()`` did not re-classify, so a node could be created clean and later
@@ -129,7 +130,7 @@ class PersistenceGateway:
             request = CommitRequest(content=changed_text, principal=principal,
                                     source_run=source_run,
                                     validation_status=ValidationStatus.SYSTEM)
-            label = self._authorise(request)
+            label = self._authorise(request, envelope)
             existing = self.graph.get(node_id)
             if existing is not None and label.sensitivity > existing.label.sensitivity:
                 # The graph API keeps labels immutable, so record the escalation and refuse
@@ -141,7 +142,8 @@ class PersistenceGateway:
         return self.graph.update(node_id, **fields)
 
     def commit_rejected(self, *, statement: str, reason: str, principal: str,
-                        source_run: str, project_id: str = "") -> Any:
+                        source_run: str, project_id: str = "",
+                        envelope: RunEnvelope | None = None) -> Any:
         """Record a rejected claim as a hash and a reason, never as retrievable text.
 
         This is the fix for persistent epistemic contamination: a conclusion the release
@@ -151,6 +153,7 @@ class PersistenceGateway:
         """
         from ..workgraph import NodeKind
 
+        self._authorise_destination(envelope)
         digest = hashlib.sha256(statement.encode("utf-8")).hexdigest()
         self.commits += 1
         node = self.graph.add(
@@ -166,12 +169,42 @@ class PersistenceGateway:
         return node
 
     # ------------------------------------------------------------------ internals
-    def _authorise(self, request: CommitRequest) -> DataLabel:
+    def _authorise_destination(self, envelope: RunEnvelope | None) -> None:
+        """Refuse a durable write the RUN's own authority does not permit.
+
+        The gateway checked the label against the store's ceiling and never looked at the
+        envelope, so ``PERSISTENT`` being absent from a profile's destinations meant nothing
+        here. ``peer_review`` says in its own notes "PERSISTENT is deliberately absent:
+        review material should not be retained" — and a review run wrote its task node, with
+        the manuscript text as the title, straight into index.db. A destination a run may not
+        reach is not reachable by writing to it from inside the run either.
+        """
+        if envelope is None:
+            return
+        if not envelope.permits_destination(Destination.PERSISTENT):
+            self.refusals += 1
+            if self._audit is not None:
+                self._audit("persistence_refused", reason="run forbids PERSISTENT",
+                            run_id=envelope.run_id)
+            raise PolicyDenied(
+                f"run profile {envelope.profile!r} does not permit the PERSISTENT "
+                "destination, so this run may not write to durable state")
+
+    def _authorise(self, request: CommitRequest,
+                   envelope: RunEnvelope | None = None) -> DataLabel:
         """Classify the content and check it may be stored."""
+        self._authorise_destination(envelope)
         labelled: Labeled = self.ingress.ensure(request.content, origin="persistence")
         label = labelled.label
         if request.label is not None:
             label = label.merged_with(request.label)
+
+        if envelope is not None and label.sensitivity > envelope.max_label.sensitivity:
+            self.refusals += 1
+            raise PolicyDenied(
+                f"content classified {label.sensitivity.name} exceeds this run's ceiling "
+                f"of {envelope.max_label.sensitivity.name}; it may not be written to "
+                "durable state")
 
         if label.sensitivity > self.max_label:
             self.refusals += 1

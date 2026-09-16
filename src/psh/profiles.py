@@ -47,6 +47,10 @@ class WorkProfile:
     risk: RiskTier
     require_claim_support: bool = True
     require_citation: bool = False
+    #: Whether this posture refuses components that are not process-isolated. The field was
+    #: missing entirely, so ``clinical_research`` could not turn on the requirement its own
+    #: notes describe — the policy switch existed and no profile could reach it.
+    require_isolated_tools: bool = False
     budget: Budget = field(default_factory=Budget)
     rationale: str = ""
     notes: tuple[str, ...] = ()
@@ -68,6 +72,7 @@ class WorkProfile:
             require_citation=self.require_citation,
             require_claim_support=self.require_claim_support,
             autonomy=self.autonomy, risk_ceiling=self.risk, budget=self.budget,
+            require_isolated_tools=self.require_isolated_tools,
             notes=self.notes)
 
     def as_config_kwargs(self) -> dict[str, Any]:
@@ -115,6 +120,7 @@ PROFILES: Mapping[str, WorkProfile] = {
         max_label=Sensitivity.PHI,
         autonomy=Autonomy.ACT_WITH_APPROVAL, risk=RiskTier.R3_CLINICAL,
         require_claim_support=True, require_citation=False,
+        require_isolated_tools=True,
         budget=Budget(tokens_soft=80_000, tokens_hard=200_000, usd_soft=0.0, usd_hard=0.5,
                       max_model_calls=40),
         rationale=("No public destination at all, rather than relying on the classifier to "
@@ -123,7 +129,11 @@ PROFILES: Mapping[str, WorkProfile] = {
                    "depend on it being perfect. Cost ceilings are near zero because the "
                    "only permitted models are local."),
         notes=("Approval is required for state-changing tools.",
-               "A local model is required; configure one before using this profile.")),
+               "A local model is required; configure one before using this profile.",
+               "Tools must be packaged for subprocess execution (backend='subprocess'); an "
+               "in-process component is refused under this profile, because a tool sharing "
+               "the kernel's address space is governed by convention rather than by the "
+               "operating system.")),
 
     "data_science": WorkProfile(
         name="data_science",

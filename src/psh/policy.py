@@ -21,12 +21,34 @@ construct. There is no partial path.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Mapping, Sequence
+from typing import Any, ClassVar, Mapping, Sequence
 
 from .contracts import Autonomy, Budget, PolicyDenied, RiskTier, RunEnvelope
 from .labels import DataLabel, Destination, Sensitivity
 
 __all__ = ["PolicySnapshot"]
+
+
+#: Autonomy from most to least permissive; a lower index is strictly more authority. Kept
+#: identical to ``AuthorityLattice``'s ordering — imported lazily there to avoid a cycle.
+_AUTONOMY_ORDER: tuple[Autonomy, ...] = (
+    Autonomy.ACT, Autonomy.ACT_WITH_APPROVAL, Autonomy.SUGGEST, Autonomy.OBSERVE)
+
+
+def _autonomy_rank(value: Autonomy) -> int:
+    return _AUTONOMY_ORDER.index(value)
+
+
+def _earlier(a: float | None, b: float | None) -> float | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
+def _replace_budget(a: Budget, b: Budget, dimensions: Sequence[str]) -> Budget:
+    return replace(a, **{d: min(getattr(a, d), getattr(b, d)) for d in dimensions})
 
 
 def _as_label(value: Any) -> DataLabel | None:
@@ -101,7 +123,8 @@ class PolicySnapshot:
             risk=self.risk_ceiling, autonomy=self.autonomy,
             max_label=DataLabel(self.max_data_label),
             allowed_destinations=frozenset(self.allowed_destinations),
-            budget=self.budget, deadline=self.deadline, profile=self.profile_id)
+            budget=self.budget, deadline=self.deadline, profile=self.profile_id,
+            require_isolated_tools=self.require_isolated_tools)
 
     def envelope(self, *, clamp: bool = False, **kw: Any) -> RunEnvelope:
         """Mint a ``RunEnvelope`` under this policy. The single construction path.
@@ -144,6 +167,10 @@ class PolicySnapshot:
                 _requested("allowed_destinations", self.allowed_destinations)),
             budget=_requested("budget", self.budget),
             deadline=kw.pop("deadline", self.deadline),
+            # Requirements travel on the envelope so a gate reached from anywhere sees the
+            # run's own policy rather than whatever the kernel was configured with.
+            require_isolated_tools=(self.require_isolated_tools
+                                    or bool(kw.pop("require_isolated_tools", False))),
             profile=self.profile_id, **kw)
 
         if clamp:
@@ -155,22 +182,109 @@ class PolicySnapshot:
                 f"the authority it grants: " + "; ".join(str(v) for v in violations))
         return requested
 
+    #: Budget fields a narrower policy may not raise. Named rather than reflected so that
+    #: adding a Budget field is a deliberate decision here, as in ``AuthorityLattice``.
+    BUDGET_DIMENSIONS: ClassVar[tuple[str, ...]] = (
+        "tokens_soft", "tokens_hard", "usd_soft", "usd_hard", "seconds_soft",
+        "seconds_hard", "max_model_calls", "max_tool_calls", "max_delegations")
+
+    def violations_against(self, parent: "PolicySnapshot") -> list[str]:
+        """Every dimension on which this policy grants more than ``parent``.
+
+        ``with_()`` validated three fields — data ceiling, destinations, risk — while its
+        docstring said "widening is refused". Everything else was free: ``SUGGEST -> ACT``,
+        ``require_isolated_tools True -> False``, ``usd_hard 1 -> 999``, a longer deadline,
+        a wider declassifier list. A containment check that covers a third of the policy is
+        not a containment check, and the omissions were exactly the fields a caller would
+        want to relax.
+
+        Every field of the snapshot is now classified as an authority dimension (checked
+        here) or as descriptive metadata (``profile_id``, ``profile_version``, ``notes``,
+        ``verification_model_id``). There is no third category, so a field added to this
+        dataclass without a decision here shows up in ``test_every_policy_field_is_classified``.
+        """
+        out: list[str] = []
+        if self.max_data_label > parent.max_data_label:
+            out.append(f"max_data_label: {parent.max_data_label.name} -> "
+                       f"{self.max_data_label.name}")
+        extra = set(self.allowed_destinations) - set(parent.allowed_destinations)
+        if extra:
+            out.append(f"destinations: adds {sorted(d.name for d in extra)}")
+        if self.risk_ceiling > parent.risk_ceiling:
+            out.append(f"risk_ceiling: {parent.risk_ceiling.name} -> "
+                       f"{self.risk_ceiling.name}")
+        if _autonomy_rank(self.autonomy) < _autonomy_rank(parent.autonomy):
+            out.append(f"autonomy: {parent.autonomy.value} -> {self.autonomy.value}")
+        # A requirement that is ON in the parent may not be switched OFF by a child: each
+        # of these three makes the policy stricter when True.
+        for field_name in ("require_citation", "require_claim_support",
+                           "require_isolated_tools"):
+            if getattr(parent, field_name) and not getattr(self, field_name):
+                out.append(f"{field_name}: True -> False")
+        # A HIGHER approval threshold means FEWER operations need a human.
+        if self.approval_required_at > parent.approval_required_at:
+            out.append(f"approval_required_at: {parent.approval_required_at.name} -> "
+                       f"{self.approval_required_at.name}")
+        new_declassifiers = set(self.declassifiers) - set(parent.declassifiers)
+        if new_declassifiers:
+            out.append(f"declassifiers: adds {sorted(new_declassifiers)}")
+        if self.declassify_floor < parent.declassify_floor:
+            out.append(f"declassify_floor: {parent.declassify_floor.name} -> "
+                       f"{self.declassify_floor.name}")
+        if parent.deadline is not None and (self.deadline is None
+                                            or self.deadline > parent.deadline):
+            out.append(f"deadline: {parent.deadline} -> {self.deadline}")
+        for dimension in self.BUDGET_DIMENSIONS:
+            mine, theirs = getattr(self.budget, dimension), getattr(parent.budget, dimension)
+            if mine > theirs:
+                out.append(f"budget.{dimension}: {theirs} -> {mine}")
+        return out
+
+    def is_narrower_than(self, parent: "PolicySnapshot") -> bool:
+        """True when this policy grants no authority ``parent`` lacks."""
+        return not self.violations_against(parent)
+
+    def enforce_within(self, parent: "PolicySnapshot", *, operation: str) -> "PolicySnapshot":
+        """Return self if contained by ``parent``, else raise naming every dimension."""
+        violations = self.violations_against(parent)
+        if violations:
+            raise PolicyDenied(
+                f"{operation}: policy {self.profile_id!r} grants authority that "
+                f"{parent.profile_id!r} does not — " + "; ".join(violations))
+        return self
+
+    def meet(self, other: "PolicySnapshot") -> "PolicySnapshot":
+        """The greatest lower bound of two policies: every dimension at its stricter value.
+
+        Used where clamping is kinder than refusing — applying a broad per-run policy under
+        a narrow kernel policy, for instance. The result is contained by both inputs, which
+        is the property ``test_meet_is_contained_by_both_inputs`` checks.
+        """
+        return replace(
+            self,
+            profile_id=f"{self.profile_id}∩{other.profile_id}",
+            max_data_label=min(self.max_data_label, other.max_data_label),
+            allowed_destinations=tuple(d for d in self.allowed_destinations
+                                       if d in set(other.allowed_destinations)),
+            require_citation=self.require_citation or other.require_citation,
+            require_claim_support=self.require_claim_support or other.require_claim_support,
+            require_isolated_tools=(self.require_isolated_tools
+                                    or other.require_isolated_tools),
+            autonomy=(self.autonomy if _autonomy_rank(self.autonomy)
+                      >= _autonomy_rank(other.autonomy) else other.autonomy),
+            risk_ceiling=min(self.risk_ceiling, other.risk_ceiling),
+            budget=_replace_budget(self.budget, other.budget, self.BUDGET_DIMENSIONS),
+            deadline=_earlier(self.deadline, other.deadline),
+            approval_required_at=min(self.approval_required_at, other.approval_required_at),
+            declassifiers=tuple(d for d in self.declassifiers
+                                if d in set(other.declassifiers)),
+            declassify_floor=max(self.declassify_floor, other.declassify_floor),
+            notes=tuple(dict.fromkeys(self.notes + other.notes)))
+
     def with_(self, **kw: Any) -> "PolicySnapshot":
-        """Return a narrowed copy. Widening is refused, as it is for envelopes."""
+        """Return a narrowed copy. Widening is refused, on every dimension."""
         candidate = replace(self, **kw)
-        if candidate.max_data_label > self.max_data_label:
-            raise PolicyDenied(
-                f"cannot raise the data ceiling from {self.max_data_label.name} to "
-                f"{candidate.max_data_label.name}")
-        if not set(candidate.allowed_destinations) <= set(self.allowed_destinations):
-            extra = set(candidate.allowed_destinations) - set(self.allowed_destinations)
-            raise PolicyDenied(
-                f"cannot add destinations: {sorted(d.name for d in extra)}")
-        if candidate.risk_ceiling > self.risk_ceiling:
-            raise PolicyDenied(
-                f"cannot raise the risk ceiling from {self.risk_ceiling.name} to "
-                f"{candidate.risk_ceiling.name}")
-        return candidate
+        return candidate.enforce_within(self, operation="with_()")
 
     def summary(self) -> str:
         net = "network" if self.permits_network else "local only"

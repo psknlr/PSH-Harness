@@ -16,13 +16,23 @@ this was written:
 
 Quick start::
 
-    from psh import TrustedKernel, PSHConfig, Runner, get_profile
-    from psh.protocols import SableAdapter
+    from psh import PSHConfig, TrustedKernel, get_profile
+    from psh.runtime import Runner
 
-    profile = get_profile("clinical_research")
-    kernel = TrustedKernel(PSHConfig(**profile.as_config_kwargs()))
-    runner = Runner(kernel)
-    result = runner.run("...", **profile.as_envelope_kwargs())
+    policy = get_profile("clinical_research").freeze()   # local only, PHI ceiling
+    kernel = TrustedKernel(PSHConfig(), policy=policy)
+    runner = Runner(kernel, policy=policy)
+
+    result = runner.run("Summarise the HFpEF evidence", sources={"34449189": abstract})
+    if result.released_output is None:
+        print("refused:", result.error, "| quarantined as", result.quarantine_ref)
+
+The policy is a ceiling: ``Runner`` refuses a per-run policy wider than the kernel's, and
+``policy.envelope(risk=...)`` refuses a risk above ``risk_ceiling``.
+
+(The snippet that stood here until v0.5.1 called ``profile.as_config_kwargs()`` and
+``as_envelope_kwargs()``, which have raised ``PolicyDenied`` since v0.2 — a quick start that
+cannot run is a defect in the same class as the ones this package exists to catch.)
 """
 
 from .config import PSHConfig, default_state_dir
@@ -50,7 +60,7 @@ from .profiles import PROFILES, WorkProfile, get_profile, profile_names
 from .runtime import DEFAULT_SYSTEM_PROMPT, RunResult, Runner
 from .workgraph import EdgeKind, NodeKind, WorkGraph
 
-__version__ = "0.4.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "TrustedKernel", "PSHConfig", "Runner", "RunResult", "WorkGraph", "NodeKind",

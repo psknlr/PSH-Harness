@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -52,6 +53,14 @@ __all__ = [
     "DelegationContract", "EventEnvelope", "ModelProfile", "ArtifactRef",
     "new_id", "utc_now", "content_hash",
 ]
+
+
+#: Autonomy from most to least permissive. Duplicated from ``AuthorityLattice`` because
+#: contracts may not import the kernel; ``test_autonomy_order_is_shared`` keeps them equal.
+_AUTONOMY_ORDER: tuple["Autonomy", ...] = ()   # populated below, once Autonomy exists
+
+#: A component id is also a directory name under the sandbox root.
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@:+-]{0,127}$")
 
 
 def new_id(prefix: str = "") -> str:
@@ -150,6 +159,10 @@ class Autonomy(str, Enum):
     ACT = "act"
 
 
+_AUTONOMY_ORDER = (Autonomy.ACT, Autonomy.ACT_WITH_APPROVAL, Autonomy.SUGGEST,
+                   Autonomy.OBSERVE)
+
+
 @dataclass(frozen=True, slots=True)
 class Principal:
     """Who is acting. Every event and every approval names one."""
@@ -224,6 +237,11 @@ class RunEnvelope:
     denied_capabilities: tuple[str, ...] = ()
     budget: Budget = field(default_factory=Budget)
     profile: str = "default"
+    #: Whether this run may only execute process-isolated components. It rides on the
+    #: envelope rather than on the kernel because the kernel is configured once and a run
+    #: policy may be stricter than it; a requirement held only by the kernel is a
+    #: requirement the run's own policy cannot tighten.
+    require_isolated_tools: bool = False
     deadline: float | None = None
     parent_run_id: str | None = None
     created_at: float = field(default_factory=utc_now)
@@ -261,7 +279,10 @@ class RunEnvelope:
             denied_capabilities=tuple(dict.fromkeys(
                 self.denied_capabilities + tuple(kw.pop("denied_capabilities", ())))),
             budget=budget if budget is not None else self.budget.child(),
-            profile=self.profile, deadline=kw.pop("deadline", self.deadline),
+            profile=self.profile,
+            require_isolated_tools=(self.require_isolated_tools
+                                    or bool(kw.pop("require_isolated_tools", False))),
+            deadline=kw.pop("deadline", self.deadline),
             parent_run_id=self.run_id)
 
         return AuthorityLattice.enforce(candidate, self, operation="restrict")
@@ -329,7 +350,12 @@ class ComponentManifest:
     requires_filesystem: bool = False
     requires_secrets: tuple[str, ...] = ()
     mutates: bool = False
-    min_autonomy: Autonomy = Autonomy.ACT
+    #: The least autonomy at which this component can do its job. The default is OBSERVE —
+    #: "any autonomy" — because most components only read. v0.4 defaulted it to ACT, which
+    #: read as "every component demands full autonomy"; nothing noticed because nothing
+    #: enforced the field. Enforcing it (see ``compatible_with``) makes the default
+    #: load-bearing, so it now says what the common case actually needs.
+    min_autonomy: Autonomy = Autonomy.OBSERVE
     human_approval: bool = False
     risk_tier: RiskTier = RiskTier.R1_ROUTINE
     # economics and quality
@@ -345,8 +371,26 @@ class ComponentManifest:
             raise ValueError("a component manifest requires an id and a name")
         if not 0.0 <= self.success_rate <= 1.0:
             raise ValueError("success_rate must be in [0, 1]")
-        if self.requires_network and Destination.LOCAL_COMPUTE == self.destinations == ():
-            raise ValueError("a network-requiring component must declare a destination")
+        if not _SAFE_ID.match(self.id):
+            # The id is used as a path component for an isolated component's working
+            # directory, so "../../escaped" and "/tmp/foo" have to be unrepresentable here
+            # rather than sanitised at each use. (The executor still checks containment of
+            # the resolved path: one validation is a rule, two are a boundary.)
+            raise ValueError(
+                f"component id {self.id!r} must match {_SAFE_ID.pattern} — it names a "
+                "directory when the component runs isolated, so path separators, '..' and "
+                "leading dots are not permitted")
+        if self.requires_network and not any(
+                d in (Destination.PUBLIC_REMOTE, Destination.TRUSTED_REMOTE)
+                for d in self.destinations):
+            # v0.4 wrote this as ``Destination.LOCAL_COMPUTE == self.destinations == ()``,
+            # a chained comparison requiring an enum to equal a tuple. It can never be true,
+            # so the check never ran and a network component could declare no destination at
+            # all — which the tool gateway then read as LOCAL_COMPUTE.
+            raise ValueError(
+                f"component {self.id!r} declares requires_network but none of its "
+                f"destinations {[d.name for d in self.destinations]} is remote; a "
+                "network-requiring component must name the destination it reaches")
         if self.runs_isolated and not self.entrypoint:
             raise ValueError(
                 f"component {self.id!r} declares backend={self.backend!r} but no entrypoint; "
@@ -380,6 +424,13 @@ class ComponentManifest:
                 return False, f"destination {dest.name} is not permitted by this run"
         if self.mutates and envelope.autonomy in (Autonomy.OBSERVE, Autonomy.SUGGEST):
             return False, f"component mutates state but autonomy is {envelope.autonomy.value}"
+        # ``min_autonomy`` was declared on every manifest and read by nothing: a component
+        # could say "I need ACT" and be selected under OBSERVE. It is the manifest's own
+        # statement about what it needs to function, so it belongs in the compatibility
+        # answer next to risk and destination.
+        if _AUTONOMY_ORDER.index(envelope.autonomy) > _AUTONOMY_ORDER.index(self.min_autonomy):
+            return False, (f"component requires autonomy {self.min_autonomy.value} but this "
+                           f"run grants {envelope.autonomy.value}")
         return True, "compatible"
 
 

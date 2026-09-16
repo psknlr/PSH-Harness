@@ -146,6 +146,11 @@ class AuthorityLattice:
                                           list(parent.denied_capabilities),
                                           f"dropped {sorted(missing_denials)}"))
 
+        # Turning OFF a requirement is widening. A child that drops the parent's isolation
+        # requirement would run in-process components the parent refused.
+        if parent.require_isolated_tools and not child.require_isolated_tools:
+            out.append(AuthorityViolation("require_isolated_tools", True, False))
+
         if child.risk > parent.risk:
             out.append(AuthorityViolation("risk", parent.risk.name, child.risk.name))
 
@@ -224,6 +229,8 @@ class AuthorityLattice:
 
         return _replace(
             requested,
+            require_isolated_tools=(requested.require_isolated_tools
+                                    or parent.require_isolated_tools),
             max_label=(requested.max_label
                        if requested.max_label.sensitivity <= parent.max_label.sensitivity
                        else parent.max_label),

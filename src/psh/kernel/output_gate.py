@@ -151,8 +151,16 @@ class OutputGate:
     def check(self, output: Any, envelope: RunEnvelope, *,
               sources: Mapping[str, Any] | None = None,
               require_citation: bool | None = None,
+              require_support: bool | None = None,
               destination: Destination = Destination.USER_OUTPUT) -> OutputVerdict:
-        """Verify an output. Raises on refusal; returns the verdict on success."""
+        """Verify an output. Raises on refusal; returns the verdict on success.
+
+        ``require_citation`` and ``require_support`` override the gate's construction-time
+        settings for this call, which is how a per-run policy reaches the gate. The gate is
+        built once from the kernel's policy; a run may be governed by a stricter one, and
+        only ``require_citation`` was being forwarded — so a ``writing`` run's
+        ``require_claim_support`` was judged by whatever the kernel happened to hold.
+        """
         self.checks += 1
         label = label_of(output)
         text = unwrap(output)
@@ -179,6 +187,8 @@ class OutputGate:
         sources = dict(sources or {})
         require_citation = (self.require_citation if require_citation is None
                             else require_citation)
+        require_support = (self.require_support if require_support is None
+                           else require_support)
         supports: list[ClaimSupport] = []
         unsupported: list[str] = []
         caveats: list[str] = []
@@ -212,7 +222,7 @@ class OutputGate:
                 elif not support.supports:
                     unsupported.append(f"{identifier}: {sentence[:160]}")
 
-        if unsupported and self.require_support:
+        if unsupported and require_support:
             verdict = OutputVerdict(
                 False, supports=tuple(supports), unsupported=tuple(unsupported),
                 uncited=tuple(uncited), label=label,
@@ -226,7 +236,7 @@ class OutputGate:
         # citation evades verification entirely — the sentence is neither checked (no
         # identifier) nor blocked (citation not mandatory), which is the gap the reviewer
         # found from the other direction.
-        if uncited and (require_citation or self.require_support):
+        if uncited and (require_citation or require_support):
             verdict = OutputVerdict(
                 False, supports=tuple(supports), uncited=tuple(uncited), label=label,
                 reason=(f"{len(uncited)} clinical assertion(s) carry no source identifier: "

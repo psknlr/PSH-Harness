@@ -1,47 +1,47 @@
 {
   "classification": {
     "plain_research_600c": {
-      "median_ms": 0.1043,
+      "median_ms": 0.2465,
       "label": "INTERNAL"
     },
     "plain_phi": {
-      "median_ms": 0.0246,
+      "median_ms": 0.0456,
       "label": "PHI"
     },
     "base64_phi": {
-      "median_ms": 0.0542,
+      "median_ms": 0.1004,
       "label": "PHI"
     },
     "hex_phi": {
-      "median_ms": 0.0514,
+      "median_ms": 0.0949,
       "label": "PHI"
     },
     "structured_10_fields": {
-      "median_ms": 0.4576,
+      "median_ms": 0.85,
       "label": "INTERNAL"
     },
     "random_blob_800c": {
-      "median_ms": 0.1889,
+      "median_ms": 0.42,
       "label": "SENSITIVE"
     },
-    "v03_text_only_600c_ms": 0.0417,
-    "decode_layer_overhead_x": 2.5
+    "v03_text_only_600c_ms": 0.1065,
+    "decode_layer_overhead_x": 2.31
   },
   "execpolicy": {
     "rules": 12,
-    "evaluate_median_ms": 0.02,
-    "load_and_selftest_ms": 0.297
+    "evaluate_median_ms": 0.0233,
+    "load_and_selftest_ms": 0.37
   },
   "hooks": {
     "hooks": 5,
-    "dispatch_5_hooks_median_ms": 1.3203
+    "dispatch_5_hooks_median_ms": 2.2584
   },
   "isolation": {
-    "isolated_python_spawn_median_ms": 501.5195,
-    "bare_python_spawn_median_ms": 10.7042,
-    "isolation_overhead_ms": 490.82,
-    "build_child_env_ms": 0.0052,
-    "host_policy_decide_ms": 1.9331,
+    "isolated_python_spawn_median_ms": 501.7252,
+    "bare_python_spawn_median_ms": 14.3593,
+    "isolation_overhead_ms": 487.37,
+    "build_child_env_ms": 0.0112,
+    "host_policy_decide_ms": 2.8971,
     "proxy_listener_available_here": false,
     "note": "this sandbox forbids loopback listeners; the runner fell back to the dead-port proxy (no network). Spawn overhead therefore excludes proxy start-up; measure on a workstation."
   },
@@ -50,12 +50,12 @@
     "appends": 400,
     "records": 400,
     "lost": 0,
-    "seconds": 0.145,
-    "appends_per_s": 2753,
+    "seconds": 0.242,
+    "appends_per_s": 1656,
     "chain_intact": true
   },
   "evidence_signing": {
-    "sign_ms": 0.008,
-    "verify_ms": 0.0035
+    "sign_ms": 0.0113,
+    "verify_ms": 0.005
   }
 }

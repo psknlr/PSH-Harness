@@ -2,9 +2,9 @@
   "classification": {
     "phi_note": {
       "chars": 596,
-      "median_ms": 0.1056,
-      "p95_ms": 0.1402,
-      "throughput_kb_per_s": 5510.1,
+      "median_ms": 0.2684,
+      "p95_ms": 0.3231,
+      "throughput_kb_per_s": 2168.7,
       "sensitivity": "PHI",
       "categories": [
         "medical_record_number",
@@ -14,9 +14,9 @@
     },
     "research_prose": {
       "chars": 584,
-      "median_ms": 0.1264,
-      "p95_ms": 0.1562,
-      "throughput_kb_per_s": 4512.5,
+      "median_ms": 0.2939,
+      "p95_ms": 0.3489,
+      "throughput_kb_per_s": 1940.5,
       "sensitivity": "INTERNAL",
       "categories": []
     },
@@ -24,34 +24,34 @@
   },
   "taint_propagation": {
     "depth_1": {
-      "total_ms": 0.0087,
-      "us_per_derivation": 8.684,
+      "total_ms": 0.019,
+      "us_per_derivation": 19.003,
       "label_preserved": "PHI"
     },
     "depth_10": {
-      "total_ms": 0.0381,
-      "us_per_derivation": 3.813,
+      "total_ms": 0.0736,
+      "us_per_derivation": 7.365,
       "label_preserved": "PHI"
     },
     "depth_100": {
-      "total_ms": 0.2986,
-      "us_per_derivation": 2.986,
+      "total_ms": 0.6309,
+      "us_per_derivation": 6.309,
       "label_preserved": "PHI"
     },
     "depth_1000": {
-      "total_ms": 3.0668,
-      "us_per_derivation": 3.067,
+      "total_ms": 4.901,
+      "us_per_derivation": 4.901,
       "label_preserved": "PHI"
     }
   },
   "egress_gate": {
     "refusal": {
-      "median_us": 306.44,
-      "p95_us": 482.81
+      "median_us": 541.77,
+      "p95_us": 793.28
     },
     "approval": {
-      "median_us": 261.81,
-      "p95_us": 378.77
+      "median_us": 471.95,
+      "p95_us": 637.42
     },
     "decisions_recorded": 4000
   },
@@ -62,7 +62,7 @@
     "budget": 8000,
     "reduction_ratio": 0.8651,
     "within_budget": true,
-    "compile_ms": 10.901,
+    "compile_ms": 75.092,
     "trace": {
       "candidates": 592,
       "after_dedup": 552,
@@ -78,13 +78,13 @@
     "total_capabilities": 2520,
     "flat": {
       "considered": 2520,
-      "resolve_ms": 16.835,
+      "resolve_ms": 43.868,
       "returned": 8,
       "top_hit": "statistics.cap0"
     },
     "hierarchical": {
       "considered": 840,
-      "resolve_ms": 6.189,
+      "resolve_ms": 14.789,
       "returned": 8,
       "domains_selected": [
         "statistics-harness",
@@ -93,7 +93,7 @@
       "top_hit": "statistics.cap0"
     },
     "candidates_examined_ratio": 0.3333,
-    "speedup": 2.72,
+    "speedup": 2.97,
     "context_tokens_flat": 184,
     "context_tokens_hierarchical": 184,
     "registry": {
@@ -119,50 +119,50 @@
     "false_supports": 0,
     "recall_on_supported": 1.0,
     "specificity_on_unsupported": 1.0,
-    "median_ms": 0.1392,
+    "median_ms": 0.2605,
     "abstract_chars": 502
   },
   "event_store": {
     "records": 5000,
-    "append_ms_each": 0.2204,
-    "verify_seconds": 0.1447,
-    "verify_records_per_s": 34551,
+    "append_ms_each": 0.3921,
+    "verify_seconds": 0.1816,
+    "verify_records_per_s": 27538,
     "intact": true,
-    "db_bytes": 1658880
+    "db_bytes": 1675264
   },
   "workgraph": {
     "nodes": 1001,
     "edges": 999,
-    "build_ms_per_node": 0.4033,
+    "build_ms_per_node": 0.6183,
     "lineage_depth_found": 999,
-    "lineage_ms": 18.882,
+    "lineage_ms": 23.192,
     "why_lines": 10,
-    "why_ms": 0.538,
-    "briefing_ms": 6.047,
+    "why_ms": 0.718,
+    "briefing_ms": 7.441,
     "briefing_chars": 191
   },
   "trusted_path": {
     "runs": 30,
-    "median_ms": 12.178,
-    "p95_ms": 18.189,
+    "median_ms": 16.785,
+    "p95_ms": 22.215,
     "stages": 16,
     "median_ms_by_stage": {
-      "ingest": 0.01,
-      "classify": 0.51,
-      "policy_snapshot": 0.615,
-      "bind": 3.355,
-      "plan": 0.02,
+      "ingest": 0.02,
+      "classify": 0.695,
+      "policy_snapshot": 0.84,
+      "bind": 4.705,
+      "plan": 0.025,
       "validate_plan": 0.01,
-      "resolve": 0.02,
-      "compile_context": 0.15,
-      "preflight": 0.01,
-      "execute": 0.985,
-      "capture_to_quarantine": 1.135,
-      "ingest_evidence": 1.37,
-      "verify": 1.43,
-      "release_gate": 1.445,
-      "commit_validated_state": 0.34,
-      "checkpoint": 0.385
+      "resolve": 0.06,
+      "compile_context": 0.405,
+      "preflight": 0.02,
+      "execute": 1.32,
+      "capture_to_quarantine": 1.635,
+      "ingest_evidence": 1.73,
+      "verify": 1.865,
+      "release_gate": 2.08,
+      "commit_validated_state": 0.48,
+      "checkpoint": 0.525
     },
     "all_stages_ok": true
   }

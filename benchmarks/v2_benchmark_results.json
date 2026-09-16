@@ -21,38 +21,38 @@
   },
   "classification_overhead": {
     "raw_value": {
-      "median_ms": 0.5233,
-      "p95_ms": 0.6455
+      "median_ms": 0.7731,
+      "p95_ms": 0.995
     },
     "already_labelled": {
-      "median_ms": 0.4005,
-      "p95_ms": 0.5898
+      "median_ms": 0.5955,
+      "p95_ms": 0.8067
     },
     "long_text_1900ch": {
-      "median_ms": 0.7354,
-      "p95_ms": 0.9335
+      "median_ms": 1.4948,
+      "p95_ms": 2.1433
     },
     "nested_container": {
-      "median_ms": 0.7787,
-      "p95_ms": 1.1329
+      "median_ms": 0.9852,
+      "p95_ms": 1.1449
     },
     "note": "an already-labelled value costs the same as a raw one, by design: re-classification is what closes the mislabelled-payload hole, so there is deliberately no fast path for a caller-supplied label"
   },
   "authority_check": {
     "is_subset": {
-      "median_ms": 0.0016,
-      "p95_ms": 0.0024
+      "median_ms": 0.0021,
+      "p95_ms": 0.0032
     },
     "restrict": {
-      "median_ms": 0.0118,
-      "p95_ms": 0.0187
+      "median_ms": 0.0136,
+      "p95_ms": 0.0236
     },
     "dimensions": 16
   },
   "release_path": {
     "stages": 16,
-    "median_ms": 11.688,
-    "p95_ms": 14.766,
+    "median_ms": 16.859,
+    "p95_ms": 20.317,
     "released_on_pass": true,
     "withheld_on_refusal": true,
     "quarantine_ref_retained": true,

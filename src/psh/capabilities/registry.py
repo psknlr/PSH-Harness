@@ -20,6 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .. import text as psh_text
 from ..contracts import (
     CapabilityUnavailable, ComponentKind, ComponentManifest, ContextItem, RunEnvelope,
 )
@@ -57,14 +58,18 @@ class ResolutionTrace:
                 "returned": self.returned}
 
 
-_WORD = re.compile(r"[a-z][a-z0-9-]{2,}")
 _STOP = frozenset("""the and for with from that this into over under able all any are
 was were will can could would should has have had its their there which who what when
 how why not use using used get set run make new via per etc""".split())
 
 
 def _terms(text: str) -> set[str]:
-    return {w for w in _WORD.findall(text.lower()) if w not in _STOP}
+    """Retrieval terms, for Latin and CJK alike.
+
+    An ASCII-only pattern gave a Chinese query an empty term set, and a ranking whose
+    semantic component is empty is a cost-and-latency sort wearing a relevance label.
+    """
+    return psh_text.terms(text, stopwords=_STOP)
 
 
 class CapabilityRegistry:

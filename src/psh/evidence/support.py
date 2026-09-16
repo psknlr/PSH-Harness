@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .. import text as psh_text
 from ..contracts import VerificationFailed, new_id, utc_now
 from ..labels import DataLabel, Sensitivity
 
@@ -138,8 +139,15 @@ _NUM = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*(%|percent|fold|mg|days?|months?
 
 
 def _tokens(text: str) -> set[str]:
-    words = re.findall(r"[a-z][a-z-]{2,}", text.lower())
-    return {w for w in words if w not in _STOPWORDS}
+    """Content tokens for overlap scoring, in either language.
+
+    The ASCII-only version scored a Chinese claim against its own verbatim Chinese source at
+    0% overlap and returned UNKNOWN — and because the output gate does recognise Chinese
+    clinical assertions, the combination made every Chinese clinical sentence unreleasable:
+    support was demanded and could not be found. Chinese contributes character bigrams
+    (``psh.text``), which is what makes a quoted sentence overlap with its source.
+    """
+    return psh_text.terms(text, stopwords=_STOPWORDS)
 
 
 def _certainty_of(text: str) -> Certainty:

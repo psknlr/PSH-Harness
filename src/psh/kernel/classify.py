@@ -61,6 +61,42 @@ _FALLBACK_RULES: tuple[tuple[str, "re.Pattern[str]", Sensitivity], ...] = (
      Sensitivity.PHI),
 )
 
+#: Chinese identifier shapes. Applied **in addition to** whichever detector is active,
+#: including sable: a detector trained on English clinical text does not recognise 住院号 or
+#: a mainland ID number, and a reviewer confirmed the consequence — 姓名 + 住院号 + 身份证号 +
+#: 手机号 classified as INTERNAL, which sits *below* the PUBLIC_REMOTE ceiling and was
+#: therefore releasable to a public provider. A classifier that is a safety net in one
+#: language and absent in another is worse than one that says it covers neither.
+#:
+#: The name rule is cued by a surname list rather than by "患者 + two characters", which
+#: would label 患者需要 as a name. Precision matters here in both directions: a classifier
+#: that cries PHI on ordinary prose gets turned off.
+_CJK_SURNAMES = ("王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾萧田董"
+                 "袁潘于蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊"
+                 "秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤")
+
+_CJK_RULES: tuple[tuple[str, "re.Pattern[str]", Sensitivity], ...] = (
+    ("national_id_cn",
+     re.compile(r"(?:身份证(?:号码?)?\s*[:：#]?\s*)?\b[1-9]\d{5}(?:19|20)\d{2}"
+                r"(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b"),
+     Sensitivity.PHI),
+    ("mobile_number_cn",
+     re.compile(r"(?:手机|电话|联系方式|手机号)\s*[:：#]?\s*1[3-9]\d{9}\b|\b1[3-9]\d{9}\b"),
+     Sensitivity.PHI),
+    ("hospital_record_number_cn",
+     re.compile(r"(?:住院号|病案号|病历号|门诊号|就诊号|就诊卡号|医保卡号|床号|标本号)"
+                r"\s*[:：#]?\s*[A-Za-z0-9-]{3,}"),
+     Sensitivity.PHI),
+    ("name_cued_cn",
+     re.compile(f"(?:患者|病人|姓名|受试者)\\s*[:：,，]?\\s*[{_CJK_SURNAMES}]"
+                r"[\u4e00-\u9fff]{1,2}(?![\u4e00-\u9fff])"),
+     Sensitivity.PHI),
+    ("date_of_birth_cn",
+     re.compile(r"(?:出生(?:日期|年月)|生于)\s*[:：]?\s*\d{4}\s*[年/-]\s*\d{1,2}"),
+     Sensitivity.PHI),
+)
+
+
 #: Credential shapes. These are SECRET rather than PHI: a leaked key is a different and
 #: broader failure than a leaked identifier.
 _SECRET_RULES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
@@ -245,6 +281,14 @@ class Classifier:
                 if pattern.search(text):
                     categories.append(name)
                     sensitivity = max(sensitivity, level)
+
+        # Chinese identifiers are checked whichever detector ran above: sable's rule set is
+        # English-language, so relying on it here would leave the gap unclosed in exactly
+        # the configuration the README calls the recommended one.
+        for name, pattern, level in _CJK_RULES:
+            if pattern.search(text):
+                categories.append(name)
+                sensitivity = max(sensitivity, level)
 
         rationale = (f"{len(categories)} finding(s) via {self.detector_name}"
                      if categories else f"no findings via {self.detector_name}")

@@ -8,12 +8,35 @@ promised hard isolation, distributed scheduling and multi-tenancy that this does
 
 > **A policy-enforced control plane for biomedical scientific agents.** Research prototype.
 
-## v0.5 — enforcement closure
+## v0.5.1 — gate composition
 
-No new subsystems. This release closes the gap an external review measured between what the
-package *implements* and what its *executing path* uses. The defects shared one shape — a
-control that exists, a main path that does not call it, and a README describing the
-control — and each is now closed with a test that drives the main path:
+v0.5 asked whether each control was on the path that executes. A second review ran the
+result and asked the next question down: **does the control see everything it is deciding
+about?** Twelve findings, every one reproduced by running the code before it was fixed and
+pinned by a test afterwards (`tests/test_gate_composition.py`, and per-dimension property
+tests in `tests/test_authority_property.py`). Full detail in
+`docs/V5_1_GATE_COMPOSITION.md`.
+
+| Closed | What was wrong |
+| --- | --- |
+| **The kernel is the policy root** | `Runner(policy=…)` replaced `kernel.policy` unchecked. A `peer_review` kernel — "no network egress of any kind" — handed a `literature` policy made a successful public model call: `model_calls=1, refusals=0`. A run policy is now contained by the kernel's on every dimension (`clamp_policy=True` narrows instead of refusing). |
+| **A gate reads every destination** | `ToolGateway` read `destinations[0]`, so a component declaring `(LOCAL_COMPUTE, PUBLIC_REMOTE)` was judged local and PHI passed — while the isolated executor read the same tuple with `any()` and opened the network for it. |
+| **A prompt is a question, not a verdict** | An execution-policy `prompt` returned `allowed=True` immediately, skipping the absolute denylist and the path check behind it: `git push --force` and a write to `/etc/passwd` both came back allowed. |
+| **Unverifiable is refused** | The payload walker returned `[]` when it hit its depth limit, so burying a path nine levels deep defeated the check. Truncation is now reported and refused. |
+| **One authority predicate** | `DelegationGateway` hand-rolled containment over four dimensions beside a lattice covering sixteen; a child with R4/ACT, unrestricted capabilities and 999× the budget was allowed. The property test missed it because its child widened *every* dimension at once and always failed on tokens first — it is now one dimension at a time, verified non-vacuous by mutation. |
+| **A ceiling of zero is not "exceeded"** | `state.usd >= usd_hard` fires at zero spend, so `peer_review` (`usd_hard=0.0`, local models only) refused every run it was given. |
+| **Persistence obeys the run** | `PersistenceGateway` never looked at the envelope, so a `peer_review` run wrote its task node — manuscript text as the title — into `index.db`. Such runs are now **ephemeral**: gated, verified, released and event-logged, but nothing durable is written. |
+| **Chinese text is not invisible** | Four ASCII-only tokenisers: distinct Chinese memories deduplicated to one, a Chinese claim scored 0% overlap against its own source, Chinese queries ranked by cost alone, and 姓名+住院号+身份证号+手机号 classified INTERNAL — releasable to a public provider. One CJK-aware segmenter (`psh/text.py`) plus Chinese identifier rules. |
+| **Isolation holds at its edges** | `manifest.id="../../escaped"` put a subprocess outside the sandbox root; a timeout killed the process but not the process group it created (a grandchild outlived it and wrote a file); `allowed_hosts` was consumed twice; non-JSON stdout was silently accepted. |
+| **Manifest contracts are enforced** | `requires_network` validation was a chained comparison that can never be true; `min_autonomy` was read nowhere (and defaulted to `ACT`, which nothing noticed because nothing enforced it). |
+| **The loop detector detects loops** | Keyed on an always-empty `task_id`, counted globally, never cleared: three independent users asking the same question got `ok, ok, StuckLoop`. |
+| **Lifecycle and settings** | `Runner` reuses `kernel.graph` instead of opening a second unclosed SQLite connection; `Quarantine` recomputes paths so its "survives process death" claim is true; `Runner.STAGES` matches the stages a run emits; `context_token_budget` is applied and the three settings nothing reads are listed as `PENDING_FIELDS` with a test that pins them. |
+
+`clinical_research` now sets `require_isolated_tools=True` — the switch existed in v0.5 and
+`WorkProfile` had no field to reach it, so the profile's own notes described a posture it
+could not adopt. In-process tools are refused under that profile.
+
+## v0.5 — enforcement closure
 
 | Closed | What was wrong |
 | --- | --- |
@@ -36,19 +59,31 @@ contain NUL bytes and break `python -m compileall`).
 Run tests:
 
 ```bash
-python -m pytest tests/ -q          # 230 pass; `-m live` opts into network tests
+python -m pytest tests/ -q          # 314 pass; `-m live` opts into network tests
 python -m compileall -q src         # clean
 ```
+
+`hypothesis` is required, not optional: without it the authority-monotonicity property
+tests — the only exhaustive check of the lattice — used to skip silently, and a run that
+reports "223 passed, 1 skipped" is hiding the coverage that matters. They now fail instead
+(`PSH_ALLOW_MISSING_HYPOTHESIS=1` opts out deliberately).
 
 ## What is enforced, and what is not
 
 Enforced, with a test that drives the executing path:
 
 * no value reaches a gateway unclassified, and a caller-supplied label is re-validated;
-* no envelope is wider than the policy that minted it, on any of the lattice's dimensions;
+* no envelope is wider than the policy that minted it, and no run policy is wider than the
+  kernel's, on any of the lattice's dimensions;
 * every model call, tool call and delegation passes the broker, which records an event;
+* a tool call is judged against every destination its component declares, and a payload the
+  gate cannot finish walking is refused rather than assumed clean;
+* a run under a profile without `PERSISTENT` writes nothing durable;
 * output is quarantined and `released_output` stays `None` unless the release gate passed;
-* a `backend="subprocess"` component cannot read the kernel's environment.
+* a `backend="subprocess"` component cannot read the kernel's environment, cannot escape the
+  sandbox root through its own id, and cannot outlive its timeout through a child process;
+* Chinese and English are handled by the same classification, dedup, retrieval and
+  claim-support machinery.
 
 **Not** enforced, stated plainly:
 
@@ -93,6 +128,14 @@ and you get it; ask for more and you get a `PolicyDenied` naming the dimension.
 `clinical_research` is deliberately unusable without a local model. That is the profile
 working as intended.
 
+## What this is not
+
+There is no agent loop. `_plan()` splits sentences and `resolve` injects capability
+manifests into a prompt; there is no typed plan, no tool → observation → replan cycle, no
+executor. The strong parts are policy, evidence, provenance, the WorkGraph and the gateways
+— which is why the line at the top says *control plane*, and why "framework" would be an
+overclaim. Building that middle layer is the next release's work, not this one's.
+
 ## Earlier releases
 
 * **v0.4** — six enforcement patterns adopted from Codex (read from source) and Claude Code
@@ -106,6 +149,7 @@ working as intended.
 
 ## Scope
 
-Research prototype. Not clinical-safe, not production-ready. See
-`docs/V5_ENFORCEMENT_CLOSURE.md` for the review items this release closes, and the ones it
-deliberately leaves open. MIT licensed.
+Research prototype. Not clinical-safe, not production-ready.
+`docs/V5_1_GATE_COMPOSITION.md` and `docs/V5_ENFORCEMENT_CLOSURE.md` list what each release
+closed and what it deliberately left open — including that no OS sandbox ships, so a
+`backend="python"` component is confined by nothing. MIT licensed.

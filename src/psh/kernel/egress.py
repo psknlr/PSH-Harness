@@ -38,6 +38,7 @@ from ..contracts import (
 from ..labels import (
     DataLabel, Destination, Labeled, Sensitivity, label_of, unwrap,
 )
+from .authority import AuthorityLattice
 
 __all__ = ["EgressDecision", "ModelGateway", "ToolGateway", "DelegationGateway",
            "ExecutionBroker", "ApprovalEngine"]
@@ -57,6 +58,10 @@ class EgressDecision:
     reason: str
     gate: str
     target: str = ""
+    #: Every destination this decision covered. ``destination`` names the one the reason
+    #: talks about; a component reaching several is judged against all of them, and the
+    #: record has to show that rather than only the first.
+    destinations: tuple[Destination, ...] = ()
     #: Allowed, but only after a human says so — the execution policy's PROMPT decision.
     requires_approval: bool = False
     at: float = field(default_factory=time.time)
@@ -89,6 +94,8 @@ class _GateBase:
                 "egress_decision" if decision.allowed else "egress_refused",
                 gate=decision.gate, allowed=decision.allowed,
                 destination=decision.destination.name,
+                destinations=[d.name for d in (decision.destinations
+                                               or (decision.destination,))],
                 sensitivity=decision.label.sensitivity.name,
                 categories=list(decision.label.categories), target=decision.target)
         return decision
@@ -257,15 +264,24 @@ class ToolGateway(_GateBase):
         self.checks += 1
         label = label_of(payload) if isinstance(payload, Labeled) else DataLabel()
         raw = unwrap(payload)
-        destination = (manifest.destinations[0] if manifest.destinations
-                       else Destination.LOCAL_COMPUTE)
+        # EVERY destination the component declares, not just the first. v0.4 read
+        # ``manifest.destinations[0]``, so a component declaring
+        # ``(LOCAL_COMPUTE, PUBLIC_REMOTE)`` was judged as local and a PHI payload passed —
+        # while ``IsolatedExecutor.allowed_hosts`` looked at the same tuple with ``any()``
+        # and opened the network for it. One gate reading the first element while the next
+        # reads all of them is how a label check and a capability grant come to disagree.
+        destinations = tuple(manifest.destinations) or (Destination.LOCAL_COMPUTE,)
+        destination = destinations[0]
         target = manifest.id
+
+        def refuse(reason: str, at: Destination | None = None) -> EgressDecision:
+            return self._record(EgressDecision(
+                allowed=False, destination=at or destination, label=label, gate=self.name,
+                target=target, destinations=destinations, reason=reason))
 
         ok, why = manifest.compatible_with(envelope)
         if not ok:
-            return self._record(EgressDecision(
-                allowed=False, destination=destination, label=label, gate=self.name,
-                target=target, reason=f"component rejected by run authority: {why}"))
+            return refuse(f"component rejected by run authority: {why}")
 
         # A component's declared ceiling applies at EVERY destination, including local
         # ones. An earlier version skipped this check for local destinations on the
@@ -275,20 +291,22 @@ class ToolGateway(_GateBase):
         # write identifiers into a log, a cache, or a shared file it manages. Honour the
         # declaration wherever the component runs.
         if label.sensitivity > manifest.max_label:
-            return self._record(EgressDecision(
-                allowed=False, destination=destination, label=label, gate=self.name,
-                target=target,
-                reason=(f"payload is {label.sensitivity.name} but component {target} "
-                        f"declares it accepts at most {manifest.max_label.name}")))
+            return refuse(f"payload is {label.sensitivity.name} but component {target} "
+                          f"declares it accepts at most {manifest.max_label.name}")
 
-        if not label.permits(destination, self.ceilings):
-            return self._record(EgressDecision(
-                allowed=False, destination=destination, label=label, gate=self.name,
-                target=target,
-                reason=(f"payload classified {label.sensitivity.name} may not reach "
-                        f"{destination.name} via {target}")))
+        for candidate in destinations:
+            if not envelope.permits_destination(candidate):
+                return refuse(
+                    f"component {target} reaches {candidate.name}, which this run's "
+                    f"profile {envelope.profile!r} does not permit", at=candidate)
+            if not label.permits(candidate, self.ceilings):
+                return refuse(
+                    f"payload classified {label.sensitivity.name} may not reach "
+                    f"{candidate.name} via {target}", at=candidate)
 
         text = _flatten_text(raw)
+        requires_approval = False
+        approval_reason = ""
 
         # Declarative policy first. A command payload is anything with a "command"/"cmd"/
         # "argv" key or a bare string.
@@ -296,38 +314,44 @@ class ToolGateway(_GateBase):
         if command is not None:
             evaluation = self.policy.evaluate(command)
             if evaluation.decision.value == "forbidden":
-                return self._record(EgressDecision(
-                    allowed=False, destination=destination, label=label, gate=self.name,
-                    target=target,
-                    reason=(f"execution policy forbids this command: "
-                            f"{evaluation.describe()}; refused regardless of autonomy")))
+                return refuse(f"execution policy forbids this command: "
+                              f"{evaluation.describe()}; refused regardless of autonomy")
             if evaluation.decision.value == "prompt":
-                return self._record(EgressDecision(
-                    allowed=True, destination=destination, label=label, gate=self.name,
-                    target=target, requires_approval=True,
-                    reason=f"execution policy requires approval: {evaluation.describe()}"))
+                # Record that approval is needed and KEEP CHECKING. v0.4 returned here, so a
+                # command the policy merely wanted confirmed skipped the absolute denylist
+                # and the allowed-path check behind it: ``git push --force`` — documented as
+                # "refused regardless of autonomy" — and a write to /etc/passwd both came
+                # back allowed. A prompt is a question, not a verdict.
+                requires_approval = True
+                approval_reason = (f"execution policy requires approval: "
+                                   f"{evaluation.describe()}")
 
         for pattern in self.DENIED_COMMANDS:
             if pattern.search(text):
-                return self._record(EgressDecision(
-                    allowed=False, destination=destination, label=label, gate=self.name,
-                    target=target,
-                    reason=(f"payload matches a denied command pattern "
-                            f"({pattern.pattern[:40]}); refused regardless of autonomy")))
+                return refuse(f"payload matches a denied command pattern "
+                              f"({pattern.pattern[:40]}); refused regardless of autonomy")
 
         if (manifest.mutates or manifest.requires_filesystem) and self.allowed_paths:
-            for path in _candidate_paths(raw):
-                ok, why = self._path_permitted(path)
-                if not ok:
-                    return self._record(EgressDecision(
-                        allowed=False, destination=destination, label=label,
-                        gate=self.name, target=target,
-                        reason=(f"access to {path!r} is outside the allowed paths "
-                                f"{list(self.allowed_paths)}: {why}")))
+            paths, truncated = _collect_paths(raw)
+            if truncated:
+                # A walk that hit its depth or node budget did not see the whole payload, so
+                # "no paths found" is not a finding. v0.4 returned ``[]`` here and the gate
+                # read it as "nothing to check" — burying a target under nine levels of
+                # nesting was enough to write anywhere. Unverifiable is a refusal, the rule
+                # ``labels.deep_label_of`` already applies when its own walk is truncated.
+                return refuse("payload is too deeply nested or too large to verify its "
+                              "filesystem targets; refused rather than assumed safe")
+            for path in paths:
+                allowed, why = self._path_permitted(path)
+                if not allowed:
+                    return refuse(f"access to {path!r} is outside the allowed paths "
+                                  f"{list(self.allowed_paths)}: {why}")
 
         return self._record(EgressDecision(
             allowed=True, destination=destination, label=label, gate=self.name,
-            target=target, reason=f"{label.sensitivity.name} permitted for {target}"))
+            target=target, destinations=destinations, requires_approval=requires_approval,
+            reason=(approval_reason if requires_approval
+                    else f"{label.sensitivity.name} permitted for {target}")))
 
 
 class DelegationGateway(_GateBase):
@@ -346,34 +370,28 @@ class DelegationGateway(_GateBase):
         label = contract.projection.label if contract.projection else DataLabel()
         child = contract.envelope
 
-        extra_dest = child.allowed_destinations - parent.allowed_destinations
-        if extra_dest:
+        # ONE authority predicate. v0.4 re-implemented containment here by hand — four
+        # dimensions out of the lattice's sixteen — so a child could be handed R4/ACT,
+        # unrestricted capabilities, none of the parent's denials, and 999x the cost, time
+        # and call ceilings, and this gate still returned allowed=True. The lattice already
+        # knew: ``AuthorityLattice.violations`` named all nine on the same pair. A rule
+        # re-written at a second call site is a rule that drifts.
+        violations = AuthorityLattice.violations(child, parent)
+        if violations:
             return self._record(EgressDecision(
                 allowed=False, destination=Destination.LOCAL_COMPUTE, label=label,
                 gate=self.name, target=contract.backend,
-                reason=("delegation would widen authority: destinations "
-                        f"{sorted(d.name for d in extra_dest)} not held by the parent run")))
+                reason=("delegation would widen authority beyond the parent run: "
+                        + "; ".join(str(v) for v in violations))))
 
-        if child.max_label.sensitivity > parent.max_label.sensitivity:
-            return self._record(EgressDecision(
-                allowed=False, destination=Destination.LOCAL_COMPUTE, label=label,
-                gate=self.name, target=contract.backend,
-                reason=("delegation would raise the data ceiling from "
-                        f"{parent.max_label.sensitivity.name} to "
-                        f"{child.max_label.sensitivity.name}")))
-
+        # Not an authority dimension, so not the lattice's business: whether the projection
+        # being handed over fits inside the (already contained) child envelope.
         if label.sensitivity > child.max_label.sensitivity:
             return self._record(EgressDecision(
                 allowed=False, destination=Destination.LOCAL_COMPUTE, label=label,
                 gate=self.name, target=contract.backend,
                 reason=(f"projection is {label.sensitivity.name} but the delegate's "
                         f"envelope permits at most {child.max_label.sensitivity.name}")))
-
-        if child.budget.tokens_hard > parent.budget.tokens_hard:
-            return self._record(EgressDecision(
-                allowed=False, destination=Destination.LOCAL_COMPUTE, label=label,
-                gate=self.name, target=contract.backend,
-                reason="delegation would exceed the parent's hard token budget"))
 
         return self._record(EgressDecision(
             allowed=True, destination=Destination.LOCAL_COMPUTE, label=label,
@@ -639,7 +657,7 @@ class ExecutionBroker:
             self.isolated_tool_calls += 1
             return self.isolation.invoke(manifest, payload, envelope), "isolated"
 
-        if self.require_isolation:
+        if self.require_isolation or envelope.require_isolated_tools:
             self.refusals += 1
             raise PolicyDenied(
                 f"this run requires process-isolated tools and component {manifest.id!r} "
@@ -733,28 +751,48 @@ def _candidate_command(payload: Any) -> Any:
     return None
 
 
-def _candidate_paths(payload: Any, _depth: int = 0, _keyed: bool = False) -> list[str]:
-    """Extract values that look like filesystem paths, at any depth.
+#: Limits on the payload walk that looks for filesystem targets. Exceeding either means the
+#: gate could not see the whole payload — which is a refusal, not a pass. Matched to the
+#: budget ``labels.walk_values`` uses, so the two walks agree about what "too big" means.
+_PATH_WALK_MAX_DEPTH = 8
+_PATH_WALK_MAX_NODES = 5_000
 
-    v0.4 looked only at top-level keys, so ``{"config": {"target": "/etc/shadow"}}`` named
-    a path the gate never saw — and nesting is the ordinary shape of a structured tool
-    payload, not an adversarial one. The walk is depth-limited like every other recursive
-    check in this package, and a list under a path-like key contributes each of its string
-    elements.
+
+def _collect_paths(payload: Any) -> tuple[list[str], bool]:
+    """Return (paths found, walk truncated).
+
+    The second element is the important one. v0.4's walker returned ``[]`` when it hit its
+    depth limit, and the caller could not tell "this payload names no paths" from "I stopped
+    looking" — so nesting a target nine levels deep defeated the check entirely. Truncation
+    is now reported, and the gate refuses on it.
     """
-    if _depth > 8:
-        return []
     out: list[str] = []
+    budget = [_PATH_WALK_MAX_NODES]
+    truncated = _walk_paths(payload, out, budget, 0, False)
+    return list(dict.fromkeys(out)), truncated
+
+
+def _walk_paths(payload: Any, out: list[str], budget: list[int], depth: int,
+                keyed: bool) -> bool:
+    if depth > _PATH_WALK_MAX_DEPTH or budget[0] <= 0:
+        return True
+    budget[0] -= 1
+    truncated = False
     if isinstance(payload, Mapping):
         for key, value in payload.items():
-            keyed = any(k in str(key).lower() for k in _PATH_KEYS)
-            out.extend(_candidate_paths(value, _depth + 1, keyed))
+            is_path_key = any(k in str(key).lower() for k in _PATH_KEYS)
+            truncated |= _walk_paths(value, out, budget, depth + 1, is_path_key)
     elif isinstance(payload, (list, tuple, set, frozenset)):
         for item in payload:
-            out.extend(_candidate_paths(item, _depth + 1, _keyed))
-    elif isinstance(payload, str) and _keyed and payload.strip():
+            truncated |= _walk_paths(item, out, budget, depth + 1, keyed)
+    elif isinstance(payload, str) and keyed and payload.strip():
         out.append(payload)
-    return list(dict.fromkeys(out))
+    return truncated
+
+
+def _candidate_paths(payload: Any) -> list[str]:
+    """Paths named by a payload. Callers that must fail closed use ``_collect_paths``."""
+    return _collect_paths(payload)[0]
 
 
 def _tool_approval_request(manifest: ComponentManifest, payload: Any, envelope: RunEnvelope,
@@ -786,9 +824,11 @@ def _tool_approval_request(manifest: ComponentManifest, payload: Any, envelope: 
         # than the payload: an approval record must not become a second copy of the data.
         action = ("invoke", content_hash(raw)[:32])
 
-    destination = (manifest.destinations[0].name if manifest.destinations
-                   else Destination.LOCAL_COMPUTE.name)
-    targets = tuple(sorted({*(_candidate_paths(raw)), destination}))
+    # Every destination, so an approval record cannot read LOCAL_COMPUTE for a call that
+    # also reaches the public internet.
+    destinations = tuple(d.name for d in manifest.destinations) or (
+        Destination.LOCAL_COMPUTE.name,)
+    targets = tuple(sorted({*(_candidate_paths(raw)), *destinations}))
     return ApprovalRequest(
         kind=kind, component=manifest.id, action=action, targets=targets,
         risk=envelope.risk.name, summary=summary or f"run {manifest.id}",

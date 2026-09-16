@@ -44,8 +44,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import os
 import select
+import signal
 import socket
 import socketserver
 import subprocess
@@ -579,22 +581,37 @@ class IsolatedRunner:
         with proxy_cm as proxy:
             env = build_child_environment(proxy_address=proxy.address, grants=grants,
                                           workdir=workdir)
-            wrapped = self.sandbox.wrap(argv, workdir=workdir,
-                                        allow_network=bool(list(allowed_hosts)))
+            # ``hosts`` rather than ``list(allowed_hosts)``: a generator is consumed by the
+            # first list() above, so re-iterating it here silently yielded False and told
+            # the sandbox "no network" for a run that had been granted one.
+            wrapped = self.sandbox.wrap(argv, workdir=workdir, allow_network=bool(hosts))
             started = time.time()
             timed_out = False
+            # Popen rather than subprocess.run: ``run(timeout=...)`` kills only the direct
+            # child. The child is started in its own session (above), and a tool that
+            # spawned its own children left them running — a reviewer watched a grandchild
+            # outlive the "timeout and was killed" message by a second and go on to write a
+            # file. Owning the process group is the point of creating one.
+            proc = subprocess.Popen(
+                wrapped, cwd=str(workdir), env=env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                preexec_fn=_preexec(memory_mb) if sys.platform != "win32" else None,
+                start_new_session=True)
             try:
-                proc = subprocess.run(
-                    wrapped, cwd=str(workdir), env=env, input=stdin, capture_output=True,
-                    text=True, timeout=timeout_s,
-                    preexec_fn=_preexec(memory_mb) if sys.platform != "win32" else None,
-                    start_new_session=True)
-                code, out, err = proc.returncode, proc.stdout, proc.stderr
-            except subprocess.TimeoutExpired as exc:
+                out, err = proc.communicate(input=stdin, timeout=timeout_s)
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
                 timed_out = True
                 code = 124
-                out = (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-                err = (exc.stderr or b"").decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+                _kill_process_tree(proc)
+                try:
+                    out, err = proc.communicate(timeout=5)
+                except Exception:  # noqa: BLE001 - the tree is gone; take what we have
+                    out, err = "", ""
+            finally:
+                # Anything the tool left behind goes with it, timeout or not: a subprocess
+                # boundary that leaks background processes is not a boundary.
+                _kill_process_tree(proc, grace=False)
             duration = time.time() - started
             result = IsolatedResult(
                 argv=tuple(argv), exit_code=code, stdout=out[:200_000], stderr=err[:50_000],
@@ -607,6 +624,32 @@ class IsolatedRunner:
                         egress_refused=sum(not d.allowed for d in result.egress_decisions),
                         sandbox=result.sandbox, run_id=run_id)
         return result
+
+
+def _kill_process_tree(proc: "subprocess.Popen[Any]", *, grace: bool = True) -> None:
+    """Kill the child's whole process group, not only the child.
+
+    ``start_new_session=True`` puts the child in its own process group, so one signal
+    reaches everything it spawned. On Windows there are no process groups in this sense;
+    ``kill()`` there terminates the child alone, which is stated rather than papered over
+    (a Job Object is the equivalent and is left for the sandbox backend).
+    """
+    if proc.poll() is not None and not grace:
+        return
+    try:
+        if sys.platform == "win32":  # pragma: no cover - platform specific
+            proc.kill()
+            return
+        pgid = os.getpgid(proc.pid)
+        if grace:
+            os.killpg(pgid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
 
 
 def _preexec(memory_mb: int | None) -> Callable[[], None]:
@@ -638,6 +681,12 @@ class IsolationUnavailable(RuntimeError):
     isolation claim untrue in v0.4: the mechanism existed, the main path did not use it, and
     nothing in the record said which had run.
     """
+
+
+def _safe_component(name: str) -> str:
+    """One path component, with separators and traversal removed rather than trusted."""
+    cleaned = re.sub(r"[^A-Za-z0-9_.@:+-]", "_", name).lstrip(".")
+    return cleaned or "unnamed"
 
 
 class IsolatedExecutor:
@@ -685,6 +734,25 @@ class IsolatedExecutor:
                 out[str(name)] = str(value)
         return out
 
+    def _workdir_for(self, manifest: Any, envelope: Any) -> Path:
+        """The component's working directory, proven to be inside the sandbox root.
+
+        ``ComponentManifest`` now refuses an id that is not a safe path component, so this
+        is the second of two checks rather than the only one — but it is the one that holds
+        for a manifest-like object that did not come through that constructor. A component
+        called ``../../escaped`` had its subprocess running outside the sandbox root
+        entirely, and an absolute id would have discarded the root altogether.
+        """
+        root = self.workdir_root.resolve()
+        run_id = str(getattr(envelope, "run_id", "") or "no_run")
+        candidate = (root / _safe_component(run_id) / _safe_component(str(manifest.id)))
+        resolved = candidate.resolve()
+        if resolved != root and root not in resolved.parents:
+            raise IsolationUnavailable(
+                f"refusing to run component {manifest.id!r}: its working directory "
+                f"{resolved} would fall outside the sandbox root {root}")
+        return resolved
+
     def invoke(self, manifest: Any, payload: Any, envelope: Any) -> Any:
         import shlex
 
@@ -695,7 +763,7 @@ class IsolatedExecutor:
             raise IsolationUnavailable(
                 f"component {manifest.id!r} declares isolated execution but its entrypoint "
                 "is empty")
-        workdir = self.workdir_root / (getattr(envelope, "run_id", "") or "no_run") / manifest.id
+        workdir = self._workdir_for(manifest, envelope)
         stdin = json.dumps({"tool": manifest.id, "run_id": getattr(envelope, "run_id", ""),
                             "payload": payload}, default=str)
         result = self.runner.run(
@@ -717,7 +785,11 @@ class IsolatedExecutor:
             return {}
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            # A component that prints prose rather than JSON is not a protocol error worth
-            # failing the run over; it is returned as text, labelled like any other output.
-            return {"stdout": result.stdout}
+        except json.JSONDecodeError as exc:
+            # The protocol says one JSON value on stdout. v0.5 accepted prose as
+            # ``{"stdout": ...}``, which made a violated contract indistinguishable from a
+            # component that meant to return text — and a component whose real output was
+            # replaced by a warning on stdout would have been read as a successful result.
+            raise ContractViolation(
+                f"isolated component {manifest.id!r} must write one JSON value on stdout; "
+                f"got {len(text)} characters that do not parse ({exc})") from exc

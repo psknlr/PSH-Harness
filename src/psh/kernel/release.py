@@ -97,16 +97,31 @@ class Quarantine:
                 "sensitivity": label.sensitivity.name})
         return QuarantineRef(ref=ref, digest=digest, size_bytes=len(content), label=label)
 
+    def _path_for(self, ref: str) -> Path:
+        """Where this reference's content lives, index or no index.
+
+        The class docstring says the audit reference "survives process death". The content
+        did; the ``ref -> path`` mapping was in memory only, so after a restart every
+        reference raised "no quarantined content" and the surviving file was unreachable.
+        The filename is derived from the reference, so the mapping never needed to be
+        remembered — it needed to be recomputed.
+        """
+        entry = self._index.get(ref)
+        if entry is not None:
+            return Path(entry[0])
+        candidate = self.directory / f"{ref}.txt"
+        if not candidate.is_file():
+            raise VerificationFailed(f"no quarantined content for {ref}")
+        return candidate
+
     def release(self, ref: QuarantineRef, *, run_id: str = "") -> str:
         """Return the content. Only the release gate may call this."""
-        entry = self._index.get(ref.ref)
-        if entry is None:
-            raise VerificationFailed(f"no quarantined content for {ref.ref}")
+        path = self._path_for(ref.ref)
         self.released += 1
         if self._audit is not None:
             self._audit("output_released", run_id=run_id,
                         detail={"ref": ref.ref, "digest": ref.digest[:32]})
-        return Path(entry[0]).read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
 
     def refuse(self, ref: QuarantineRef, reason: str, *, run_id: str = "") -> None:
         """Mark quarantined content as refused. It stays addressable for audit."""
@@ -122,13 +137,11 @@ class Quarantine:
         operation for the person investigating a refusal, and it should look different in the
         audit log from ordinary release.
         """
-        entry = self._index.get(ref)
-        if entry is None:
-            raise VerificationFailed(f"no quarantined content for {ref}")
+        path = self._path_for(ref)
         if self._audit is not None:
             self._audit("quarantine_inspected", principal_id=principal,
                         detail={"ref": ref})
-        return Path(entry[0]).read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
 
     def stats(self) -> dict[str, Any]:
         return {"held": self.held, "released": self.released, "refused": self.refused}
